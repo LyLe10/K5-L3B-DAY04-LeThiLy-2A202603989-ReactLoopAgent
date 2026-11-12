@@ -25,82 +25,135 @@ def run_agent(question, provider, tools, max_steps=6):
     trace = []
     usage = []
 
-    for step in range(max_steps):
+    for step in range(1, max_steps + 1):
 
-        # 1. Gọi LLM
-        response = provider.complete(messages, SCHEMAS)
+        try:
+            response = provider.complete(messages, SCHEMAS)
+        except Exception as exc:
+            trace.append({
+                "event": "provider_error",
+                "step": step,
+                "error": str(exc)
+            })
+            return {
+                "status": "error",
+                "answer": "",
+                "trace": trace,
+                "usage": usage,
+                "error": str(exc)
+            }
 
-        # 2. Lưu usage
-        usage.append(response.get("usage", {}))
+        message = response["message"]
+        calls = response.get("calls") or []
+        finish = response.get("finish")
 
-        # 3. Lưu assistant message
-        messages.append(response["message"])
+        usage.append(response.get("usage") or {})
 
-        # 4. Lấy danh sách tool calls
-        calls = response.get("calls", [])
+        trace.append({
+            "event": "model",
+            "step": step,
+            "finish": finish,
+            "tool_calls": len(calls)
+        })
 
-        # 5. Nếu có tool calls
+        # Giữ nguyên assistant message
+        messages.append(message)
+
+        # Thực thi tất cả tool calls
         if calls:
 
             for call in calls:
-
                 name = call["name"]
+                call_id = call["id"]
 
-                # Parse JSON arguments
+                
+                # Bước A: Parse arguments
                 try:
-                    args = json.loads(call["arguments"])
-                except (json.JSONDecodeError, TypeError):
-                    args = None
+                    arguments = json.loads(call["arguments"])
 
-                # Thực thi công cụ
-                if not isinstance(args, dict):
+                    if not isinstance(arguments, dict):
+                        raise ValueError(
+                            "Tool arguments must be a JSON object"
+                        )
+
+                except (json.JSONDecodeError, ValueError, TypeError) as exc:
+                    arguments = call.get("arguments")
                     result = {
                         "ok": False,
                         "error": "INVALID_ARGUMENTS",
-                        "message": "Tool arguments phải là JSON object hợp lệ."
+                        "message": str(exc)
                     }
-                else:
-                    result = tools.execute(name, args)
 
-                # Lưu trace
+                else:
+                    # Bước B: Thực thi tool
+                    try:
+                        result = tools.execute(name, arguments)
+
+                    except TimeoutError as exc:
+                        result = {
+                            "ok": False,
+                            "error": "TOOL_TIMEOUT",
+                            "message": str(exc)
+                        }
+
+                    except Exception as exc:
+                        result = {
+                            "ok": False,
+                            "error": "TOOL_ERROR",
+                            "message": str(exc)
+                        }
+
+
                 trace.append({
                     "event": "tool",
-                    "step": step + 1,
+                    "step": step,
                     "name": name,
-                    "args": args,
+                    "arguments": arguments,
                     "result": result
                 })
 
-                # Đưa kết quả tool trở lại messages
                 messages.append({
                     "role": "tool",
-                    "tool_call_id": call["id"],
-                    "content": json.dumps(result, ensure_ascii=False)
+                    "tool_call_id": call_id,
+                    "content": json.dumps(
+                        result,
+                        ensure_ascii=False,
+                        default=str
+                    )
                 })
 
-            # Quay lại LLM
             continue
 
-        # 6. Nếu không có tool calls
-        if response.get("finish") == "stop":
+        # Không có tool call
+        if finish == "stop":
             return {
                 "status": "completed",
-                "answer": response["message"].get("content") or "",
+                "answer": message.get("content") or "",
                 "trace": trace,
                 "usage": usage
             }
 
-        # 7. Trường hợp finish bất thường
+        # Model bị cắt output
+        if finish == "length":
+            return {
+                "status": "error",
+                "answer": "",
+                "trace": trace,
+                "usage": usage,
+                "error": "MODEL_OUTPUT_TRUNCATED"
+            }
+
         return {
             "status": "error",
-            "answer": "LLM không hoàn thành câu trả lời.",
+            "answer": "",
             "trace": trace,
-            "usage": usage
+            "usage": usage,
+            "error": f"Unexpected finish reason: {finish}"
         }
 
     return {
         "status": "max_steps",
-        "answer": "Agent đã đạt giới hạn số bước.",
+        "answer": "",
         "trace": trace,
         "usage": usage
     }
